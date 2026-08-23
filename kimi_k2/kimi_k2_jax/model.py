@@ -652,12 +652,11 @@ def logical_sharding_constraint(x: jax.Array | QuantArray, logical_axes: Axes, m
 
 def segment_ids_to_positions(segment_ids):
     """Counts positions for segment ids."""
-
-    def scan_fun(a, b):
-        return ((a[0] + 1) * (a[1] == b[1]) + b[0], b[1])
-
-    vals = (jnp.zeros_like(segment_ids), segment_ids)
-    return jnp.array(jax.lax.associative_scan(scan_fun, vals, axis=-1)[0], dtype="int32")
+    same = jnp.pad(
+        segment_ids[..., 1:] == segment_ids[..., :-1], ((0, 0),) * (segment_ids.ndim - 1) + ((1, 0),), constant_values=False
+    )
+    starts = jnp.where(~same, jnp.arange(segment_ids.shape[-1]), 0)
+    return (jnp.arange(segment_ids.shape[-1]) - jax.lax.cummax(starts, axis=segment_ids.ndim - 1)).astype(jnp.int32)
 
 
 def _yarn_find_correction_dim(num_rotations, dim, base=10000, max_position_embeddings=2048):

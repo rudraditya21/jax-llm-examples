@@ -723,7 +723,7 @@ class KVCache(_Init):
                 continue
             if is_type(k, QuantArray):
                 quant_unrolled = jnp.roll(buf.quant, -min_start, axis=self.time_axis)
-                scale_unrolled = jnp.roll(buf.scale, -min_start, axis=self.time_axis - 1)
+                scale_unrolled = jnp.roll(buf.scale, -min_start, axis=self.time_axis)
                 buf = dataclasses.replace(buf, quant=quant_unrolled, scale=scale_unrolled)
             else:
                 buf = jnp.roll(buf, -min_start, axis=self.time_axis)
@@ -747,9 +747,11 @@ class KVCache(_Init):
 
 def segment_ids_to_positions(segment_ids):
     """Counts positions for segment ids."""
-    scan_fun = lambda a, b: ((a[0] + 1) * (a[1] == b[1]) + b[0], b[1])
-    vals = (jnp.zeros_like(segment_ids), segment_ids)
-    return jnp.array(jax.lax.associative_scan(scan_fun, vals, axis=-1)[0], dtype="int32")
+    same = jnp.pad(
+        segment_ids[..., 1:] == segment_ids[..., :-1], ((0, 0),) * (segment_ids.ndim - 1) + ((1, 0),), constant_values=False
+    )
+    starts = jnp.where(~same, jnp.arange(segment_ids.shape[-1]), 0)
+    return (jnp.arange(segment_ids.shape[-1]) - jax.lax.cummax(starts, axis=segment_ids.ndim - 1)).astype(jnp.int32)
 
 
 def _generate_pos_embeddings(
@@ -1103,7 +1105,7 @@ def _route_tokens_to_moe_experts(
     x = x.reshape((-1, x.shape[-1]))
     # not distributing the routing work avoids communication for small batches
     x = reshard(x, l2p(None, None) if replicated_routing else P(TENSOR_AXIS_NAME, None))
-    weight, scale = reshard(weight, l2p(None, None)), reshard(scale, l2p(None, None))
+    weight, scale = reshard(weight, l2p(None, None)), reshard(scale, l2p(None))
 
     z = rms_norm(x, None, cfg.norm_eps) * (cfg.embed**-0.5)
     scores = jnp.einsum("Sk,kj->Sj", z * scale, weight).astype(cfg.moe_gate_dtype)

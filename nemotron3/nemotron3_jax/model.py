@@ -704,12 +704,11 @@ class KVCache(_Init):
 
 def segment_ids_to_positions(segment_ids):
     """Counts positions for segment ids."""
-
-    def scan_fun(a, b):
-        return ((a[0] + 1) * (a[1] == b[1]) + b[0], b[1])
-
-    vals = (jnp.zeros_like(segment_ids), segment_ids)
-    return jnp.array(jax.lax.associative_scan(scan_fun, vals, axis=-1)[0], dtype="int32")
+    same = jnp.pad(
+        segment_ids[..., 1:] == segment_ids[..., :-1], ((0, 0),) * (segment_ids.ndim - 1) + ((1, 0),), constant_values=False
+    )
+    starts = jnp.where(~same, jnp.arange(segment_ids.shape[-1]), 0)
+    return (jnp.arange(segment_ids.shape[-1]) - jax.lax.cummax(starts, axis=segment_ids.ndim - 1)).astype(jnp.int32)
 
 
 
@@ -1021,10 +1020,8 @@ def mamba_block(x: jax.Array, segment_ids: jax.Array, layer: MambaLayer, cache: 
 
         BC_spec = l2p("batch", "sequence", "mamba_num_heads", "mamba_ssm_state_dim")
         B, C = jnp.repeat(B, r, axis=2, out_sharding=BC_spec), jnp.repeat(C, r, axis=2, out_sharding=BC_spec)
-        # D_residual = jnp.einsum("h,bthd->bthd", layer.D, hidden_states)
-        D_residual = jnp.einsum("h,bthd->bthd", D, hidden_states)
-
-        hidden_states = jnp.einsum("bthd,bth->bthd", hidden_states, dt)
+        D_residual = hidden_states * D[:, None]
+        hidden_states = hidden_states * dt[..., None]
         A = A.astype(hidden_states.dtype) * dt
 
         chunk_size = t if t % cfg.mamba_chunk_size != 0 else cfg.mamba_chunk_size
@@ -1037,12 +1034,13 @@ def mamba_block(x: jax.Array, segment_ids: jax.Array, layer: MambaLayer, cache: 
         # Contraction of C and B to get G (attention-weights like)
         G = jnp.einsum("bTchs,bTChs->bTcCh", C, B)
         # Compute M, equivalent to applying attention mask to weights
-        M = jnp.einsum("bTcCh,bhTcC->bTcCh", G, L)
+        M = G * L.transpose(0, 2, 3, 4, 1)
         # Compute Y_diag (apply to values)
         Y_diag = jnp.einsum("bTCch,bTchd->bTChd", M, hidden_states)
 
         # 2. Compute the state for each intra-chunk (right term of low-rank factorization of off-diagonal blocks; B terms)
-        states = jnp.einsum("bTchs,bTchd,bhTc->bThds", B, hidden_states, jnp.exp((A_cumsum[:, :, :, -1:] - A_cumsum)))
+        A_weight = jnp.exp(A_cumsum[:, :, :, -1:] - A_cumsum).transpose(0, 2, 3, 1)[..., None, None]
+        states = jnp.einsum("bTchs,bTchd->bThds", B, hidden_states * A_weight[..., 0])
 
         # previous_states = jnp.zeros_like(states[:, :1])
         # states: [b, T, h, d, s]
@@ -1050,15 +1048,15 @@ def mamba_block(x: jax.Array, segment_ids: jax.Array, layer: MambaLayer, cache: 
         states = jnp.concat([reshard(prev_ssm_state[:, None, ...], jax.typeof(states).sharding.spec), states], axis=1)
         # states: [b, (1 + T), h, d, s]
         decay_chunk = jnp.exp(_segment_sum(jnp.pad(A_cumsum[:, :, :, -1], ((0, 0),) * 2 + ((1, 0),))))
-        # decay_chunk: [b, h, (1 + T), (1 + T)'] from a segment_sum on [b, h, (1 + T)]
-        decay_chunk = decay_chunk.swapaxes(1, 3)
+        st_spec = jax.typeof(states).sharding.spec
+        decay_chunk = reshard(decay_chunk.swapaxes(1, 3), P(st_spec[0], None, None, st_spec[2]))
         # decay_chunk: [b, (1 + T)', (1 + T), h]
         new_states = jnp.einsum("bTyh,bThds->byhds", decay_chunk, states)
         states, ssm_state = new_states[:, :-1, ...], new_states[:, -1, ...]
 
         # 4. Compute state -> output conversion per chunk
         # (left term of low-rank factorization of off-diagonal blocks; C terms)
-        Y_off = jnp.einsum("bTchs,bThds->bTchd", C, states) * jnp.einsum("bhTc->bTch", jnp.exp(A_cumsum))[..., None]
+        Y_off = jnp.einsum("bTchs,bThds->bTchd", C, states) * jnp.exp(A_cumsum).transpose(0, 2, 3, 1)[..., None]
 
         # Add output of intra-chunk and inter-chunk terms (diagonal and off-diagonal blocks)
         y = Y_diag + Y_off
